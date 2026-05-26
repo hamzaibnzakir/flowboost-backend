@@ -10,8 +10,7 @@ const PORT = process.env.PORT || 3001;
 // ── Firebase Admin ────────────────────────────────────────────────────────────
 let serviceAccount;
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-  const decoded = Buffer.from(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON, "base64").toString("utf8");
-serviceAccount = JSON.parse(decoded);
+  serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 } else {
   try {
     serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./firebase-service-account.json");
@@ -25,14 +24,14 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
+app.use(cors({ origin: process.env.FRONTEND_URL || "*", methods: ["GET", "POST"] }));
 app.use("/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const OWLET_API_URL  = process.env.OWLET_API_URL  || "https://the-owlet.com/api/v2";
 const OWLET_API_KEY  = process.env.OWLET_API_KEY  || "";
-const SMM_MARKUP     = parseFloat(process.env.SMM_MARKUP   || "1.60");
+const SMM_MARKUP = parseFloat(process.env.SMM_MARKUP || "1.25");
 const USD_TO_NGN     = parseFloat(process.env.USD_TO_NGN   || "1600");
 
 // Services cache — refresh every hour
