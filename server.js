@@ -10,8 +10,7 @@ const PORT = process.env.PORT || 3001;
 // ── Firebase Admin ────────────────────────────────────────────────────────────
 let serviceAccount;
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
- const decoded = Buffer.from(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON, "base64").toString("utf8");
-  serviceAccount = JSON.parse(decoded);
+  serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 } else {
   try {
     serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./firebase-service-account.json");
@@ -101,28 +100,49 @@ app.post("/webhook/flutterwave", async (req, res) => {
     const parts  = txRef.split("_");
     if (parts.length < 3 || parts[0] !== "fw") return res.status(200).json({ received: true });
 
-    const uid    = parts[1];
-    const amount = parseFloat(data.amount);
-    const flwRef = data.flw_ref;
+    const uid          = parts[1];
+    const rawAmount    = parseFloat(data.amount);
+    const currency     = (data.currency || 'NGN').toUpperCase();
+    const flwRef       = data.flw_ref;
+
+    // Convert everything to NGN before storing
+    let amountNGN;
+    if (currency === 'NGN') {
+      amountNGN = rawAmount;
+    } else if (currency === 'USD') {
+      amountNGN = parseFloat((rawAmount * USD_TO_NGN).toFixed(2));
+    } else if (currency === 'GBP') {
+      amountNGN = parseFloat((rawAmount * USD_TO_NGN * 1.27).toFixed(2));
+    } else if (currency === 'EUR') {
+      amountNGN = parseFloat((rawAmount * USD_TO_NGN * 1.08).toFixed(2));
+    } else {
+      amountNGN = rawAmount;
+    }
+    console.log('💱 Payment: ' + currency + ' ' + rawAmount + ' → NGN ' + amountNGN);
 
     // Idempotency check
-    const existing = await db.collection("transactions").where("flwRef", "==", flwRef).limit(1).get();
-    if (!existing.empty) return res.status(200).json({ received: true, note: "Already processed" });
+    const existing = await db.collection('transactions').where('flwRef', '==', flwRef).limit(1).get();
+    if (!existing.empty) return res.status(200).json({ received: true, note: 'Already processed' });
 
-    const userRef  = db.collection("users").doc(uid);
+    const userRef  = db.collection('users').doc(uid);
     const userSnap = await userRef.get();
     if (!userSnap.exists) return res.status(200).json({ received: true });
 
     const currentBalance = userSnap.data().balance || 0;
-    const newBalance     = parseFloat((currentBalance + amount).toFixed(2));
+    const newBalance     = parseFloat((currentBalance + amountNGN).toFixed(2));
+    const amount         = amountNGN;
 
     const batch = db.batch();
     batch.update(userRef, { balance: newBalance });
 
-    const txDocRef = db.collection("transactions").doc();
+    const txDocRef = db.collection('transactions').doc();
     batch.set(txDocRef, {
-      uid, type: "topup", amount,
-      currency: data.currency,
+      uid,
+      type: 'topup',
+      amount: amountNGN,
+      originalAmount: rawAmount,
+      originalCurrency: currency,
+      currency: 'NGN',
       balanceBefore: currentBalance,
       balanceAfter: newBalance,
       flwRef, txRef,
