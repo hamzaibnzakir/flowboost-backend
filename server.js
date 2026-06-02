@@ -10,8 +10,7 @@ const PORT = process.env.PORT || 3001;
 // ── Firebase Admin ────────────────────────────────────────────────────────────
 let serviceAccount;
 if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-  const decoded = Buffer.from(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON, "base64").toString("utf8");
-serviceAccount = JSON.parse(decoded);
+  serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 } else {
   try {
     serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "./firebase-service-account.json");
@@ -357,60 +356,101 @@ app.get("/api/smm/reseller-balance", async (req, res) => {
 });
 
 // ── Daily burst campaign deductions ──────────────────────────────────────────
-async function processDailyDeductions() {
+// ── Hourly deductions for 24hr burst campaigns ───────────────────────────────
+// Runs every hour — deducts hourly cost, pauses if balance is too low
+async function processHourlyDeductions() {
   try {
     const snap = await db.collection("campaigns")
       .where("status", "==", "active")
       .where("deliveryType", "==", "burst_24hr")
       .get();
 
+    if (snap.empty) return;
+    console.log(`⏱ Processing hourly deductions for ${snap.size} campaign(s)...`);
+
     for (const campDoc of snap.docs) {
-      const camp    = campDoc.data();
-      const userRef = db.collection("users").doc(camp.uid);
+      const camp     = campDoc.data();
+      const userRef  = db.collection("users").doc(camp.uid);
       const userSnap = await userRef.get();
       if (!userSnap.exists) continue;
 
       const currentBalance = userSnap.data().balance || 0;
-      const dailyCost      = camp.costPerDay || 0;
 
-      if (currentBalance < dailyCost) {
+      // Calculate hourly cost — costPerHour stored at launch, fallback to costTotal/24
+      const hourlyCost = camp.costPerHour || Math.ceil((camp.costTotal || 0) / 24);
+
+      if (hourlyCost <= 0) continue;
+
+      if (currentBalance < hourlyCost) {
+        // Pause campaign — not enough for this hour
         await campDoc.ref.update({ status: "insufficient" });
-        console.log(`⏸ Paused campaign "${camp.name}" — low balance`);
+        console.log(`⏸ Paused "${camp.name}" — balance too low (${currentBalance} < ${hourlyCost})`);
       } else {
-        const newBalance    = parseFloat((currentBalance - dailyCost).toFixed(2));
-        const dailyVisitors = Math.round(camp.volume / (camp.duration || 1));
-        const newDelivered  = Math.min(camp.volume, (camp.deliveredCount || 0) + dailyVisitors);
-        const batch         = db.batch();
+        const newBalance   = parseFloat((currentBalance - hourlyCost).toFixed(2));
+        // Hourly visitor increment (total volume / 24 hours)
+        const hourlyVisitors = Math.round((camp.volume || 0) / 24);
+        const newDelivered   = Math.min(camp.volume, (camp.deliveredCount || 0) + hourlyVisitors);
+        const isComplete     = newDelivered >= (camp.volume || 0);
 
+        const batch  = db.batch();
         batch.update(userRef, { balance: newBalance });
 
         const txRef = db.collection("transactions").doc();
         batch.set(txRef, {
-          uid: camp.uid, type: "deduction", amount: dailyCost,
-          campaignId: campDoc.id, campaignName: camp.name,
-          balanceBefore: currentBalance, balanceAfter: newBalance,
+          uid: camp.uid,
+          type: "deduction",
+          amount: hourlyCost,
+          campaignId: campDoc.id,
+          campaignName: camp.name,
+          balanceBefore: currentBalance,
+          balanceAfter: newBalance,
+          note: "Hourly traffic delivery charge",
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
         batch.update(campDoc.ref, {
           deliveredCount: newDelivered,
-          ...(newDelivered >= camp.volume ? { status: "completed" } : {}),
+          lastChargedAt: admin.firestore.FieldValue.serverTimestamp(),
+          ...(isComplete ? { status: "completed" } : {}),
         });
 
         await batch.commit();
-        console.log(`✅ Deducted ₦${dailyCost} from ${camp.uid} for "${camp.name}"`);
+        console.log(`✅ Charged ₦${hourlyCost}/hr from ${camp.uid} for "${camp.name}" (+${hourlyVisitors} visitors)`);
       }
     }
   } catch (err) {
-    console.error("❌ Daily deduction error:", err);
+    console.error("❌ Hourly deduction error:", err);
   }
 }
 
-app.post("/api/deduct-daily", async (req, res) => {
+// Also handle non-burst scheduled campaigns (daily deduction)
+async function processDailyDeductions() {
+  try {
+    const snap = await db.collection("campaigns")
+      .where("status", "==", "active")
+      .where("deliveryType", "in", ["normal", "scheduled", "drip"])
+      .get();
+
+    for (const campDoc of snap.docs) {
+      const camp    = campDoc.data();
+      const dailyVisitors = Math.round((camp.volume || 0) / (camp.duration || 1));
+      const newDelivered  = Math.min(camp.volume, (camp.deliveredCount || 0) + dailyVisitors);
+
+      await campDoc.ref.update({
+        deliveredCount: newDelivered,
+        ...(newDelivered >= (camp.volume || 0) ? { status: "completed" } : {}),
+      });
+    }
+  } catch (err) {
+    console.error("❌ Daily update error:", err);
+  }
+}
+
+app.post("/api/deduct-hourly", async (req, res) => {
   if (req.headers["x-internal-secret"] !== process.env.INTERNAL_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-  await processDailyDeductions();
+  await processHourlyDeductions();
   res.json({ ok: true });
 });
 
@@ -421,7 +461,13 @@ app.listen(PORT, () => {
   console.log(`🛍  SMM:      GET  /api/smm/services`);
   console.log(`💊 Health:   GET  /health`);
 
+  // Hourly deductions — every 1 hour
+  const hourlyInterval = 3600000;
+  setInterval(processHourlyDeductions, hourlyInterval);
+  console.log(`⏱  Hourly deductions: every 60 min`);
+
+  // Daily delivery update — every 24 hours
+  setInterval(processDailyDeductions, 86400000);
   const interval = parseInt(process.env.CRON_INTERVAL_MS) || 3600000;
-  setInterval(processDailyDeductions, interval);
-  console.log(`⏱  Cron: every ${interval / 1000}s`);
+  console.log(`⏱  Daily updates: every 24h`);
 });
