@@ -1,7 +1,6 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const https = require("https");
 const admin = require("firebase-admin");
 
 const app = express();
@@ -30,53 +29,7 @@ app.use("/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const OWLET_API_URL  = process.env.OWLET_API_URL  || "https://the-owlet.com/api/v2";
-const OWLET_API_KEY  = process.env.OWLET_API_KEY  || "";
-const SMM_MARKUP = parseFloat(process.env.SMM_MARKUP || "1.25");
 const USD_TO_NGN     = parseFloat(process.env.USD_TO_NGN   || "1600");
-
-// Services cache — refresh every hour
-let servicesCache     = null;
-let servicesCacheTime = 0;
-const CACHE_TTL       = 3600000;
-
-// ── Owlet API helper ──────────────────────────────────────────────────────────
-function owletRequest(params) {
-  return new Promise((resolve, reject) => {
-    const body = new URLSearchParams({ key: OWLET_API_KEY, ...params }).toString();
-    const urlObj = new URL(OWLET_API_URL);
-
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Content-Length": Buffer.byteLength(body),
-        "User-Agent": "Mozilla/5.0",
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (d) => data += d);
-      res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error("Invalid response: " + data.slice(0, 100))); }
-      });
-    });
-
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-// Convert Owlet NGN rate to our NGN price with markup
-// Owlet rates are per 1000 already in NGN (from the balance response showing NGN)
-function applyMarkup(rate) {
-  return Math.ceil(parseFloat(rate) * SMM_MARKUP);
-}
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
@@ -157,202 +110,6 @@ app.post("/webhook/flutterwave", async (req, res) => {
   } catch (err) {
     console.error("❌ Webhook error:", err);
     return res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ── SMM: Get services ─────────────────────────────────────────────────────────
-app.get("/api/smm/services", async (req, res) => {
-  try {
-    const now = Date.now();
-    if (servicesCache && now - servicesCacheTime < CACHE_TTL) {
-      return res.json(servicesCache);
-    }
-
-    const raw = await owletRequest({ action: "services" });
-    if (!Array.isArray(raw)) {
-      return res.status(502).json({ error: "Bad response from provider" });
-    }
-
-    // Map Owlet fields — rate is per 1000, already in NGN
-    const services = raw.map((s) => ({
-      service:   s.service,
-      name:      s.name,
-      category:  s.category,
-      type:      s.type,
-      min:       parseInt(s.min),
-      max:       parseInt(s.max),
-      dripfeed:  s.dripfeed,
-      refill:    s.refill,
-      cancel:    s.cancel,
-      rate_ngn:  applyMarkup(s.rate), // our price per 1K in NGN
-    }));
-
-    servicesCache     = services;
-    servicesCacheTime = now;
-    console.log(`✅ Loaded ${services.length} SMM services from Owlet`);
-    res.json(services);
-
-  } catch (err) {
-    console.error("❌ SMM services error:", err);
-    res.status(500).json({ error: "Failed to fetch services" });
-  }
-});
-
-// ── SMM: Place order ──────────────────────────────────────────────────────────
-app.post("/api/smm/order", async (req, res) => {
-  try {
-    const { uid, serviceId, link, quantity, campaignName } = req.body;
-    if (!uid || !serviceId || !link || !quantity) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    // Refresh cache if needed
-    const now = Date.now();
-    if (!servicesCache || now - servicesCacheTime >= CACHE_TTL) {
-      const raw = await owletRequest({ action: "services" });
-      servicesCache = raw.map((s) => ({
-        service: s.service, name: s.name, category: s.category,
-        type: s.type, min: parseInt(s.min), max: parseInt(s.max),
-        dripfeed: s.dripfeed, refill: s.refill, cancel: s.cancel,
-        rate_ngn: applyMarkup(s.rate),
-      }));
-      servicesCacheTime = now;
-    }
-
-    const service = servicesCache.find((s) => s.service == serviceId);
-    if (!service) return res.status(404).json({ error: "Service not found" });
-
-    const qty = parseInt(quantity);
-    if (qty < service.min || qty > service.max) {
-      return res.status(400).json({ error: `Quantity must be between ${service.min} and ${service.max}` });
-    }
-
-    // Cost in NGN
-    const costNGN = Math.ceil((qty / 1000) * service.rate_ngn);
-
-    // Check user balance
-    const userRef  = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) return res.status(404).json({ error: "User not found" });
-
-    const currentBalance = userSnap.data().balance || 0;
-    if (currentBalance < costNGN) {
-      return res.status(400).json({
-        error: "Insufficient balance",
-        required: costNGN,
-        balance: currentBalance,
-      });
-    }
-
-    // Place order on Owlet
-    const owletRes = await owletRequest({
-      action:   "add",
-      service:  serviceId,
-      link:     link,
-      quantity: qty,
-    });
-
-    if (owletRes.error) {
-      return res.status(400).json({ error: owletRes.error });
-    }
-
-    const owletOrderId = owletRes.order;
-    const newBalance   = parseFloat((currentBalance - costNGN).toFixed(2));
-
-    // Save order + deduct balance atomically
-    const batch      = db.batch();
-    const orderRef   = db.collection("smm_orders").doc();
-    const txRef      = db.collection("transactions").doc();
-
-    batch.set(orderRef, {
-      uid,
-      owletOrderId,
-      serviceId:    parseInt(serviceId),
-      serviceName:  service.name,
-      category:     service.category,
-      link,
-      quantity:     qty,
-      costNGN,
-      status:       "pending",
-      campaignName: campaignName || service.name,
-      createdAt:    admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    batch.update(userRef, { balance: newBalance });
-
-    batch.set(txRef, {
-      uid,
-      type:         "deduction",
-      amount:       costNGN,
-      campaignName: campaignName || service.name,
-      balanceBefore: currentBalance,
-      balanceAfter:  newBalance,
-      smmOrderId:   orderRef.id,
-      createdAt:    admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    await batch.commit();
-
-    console.log(`✅ SMM order #${owletOrderId} — ${service.name} — ₦${costNGN} — user ${uid}`);
-    res.json({ success: true, orderId: orderRef.id, owletOrderId, cost: costNGN, newBalance });
-
-  } catch (err) {
-    console.error("❌ SMM order error:", err);
-    res.status(500).json({ error: "Failed to place order" });
-  }
-});
-
-// ── SMM: Get user orders ──────────────────────────────────────────────────────
-app.get("/api/smm/orders/:uid", async (req, res) => {
-  try {
-    const snap = await db.collection("smm_orders")
-      .where("uid", "==", req.params.uid)
-      .orderBy("createdAt", "desc")
-      .limit(50)
-      .get();
-    res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-  } catch (err) {
-    console.error("❌ Fetch orders error:", err);
-    res.status(500).json({ error: "Failed to fetch orders" });
-  }
-});
-
-// ── SMM: Check order status ───────────────────────────────────────────────────
-app.post("/api/smm/status", async (req, res) => {
-  try {
-    const { owletOrderId, orderId } = req.body;
-    const status = await owletRequest({ action: "status", order: owletOrderId });
-
-    if (orderId && status.status) {
-      const s = status.status.toLowerCase();
-      const normalized =
-        s.includes("complet") ? "completed" :
-        s.includes("progress") || s.includes("processing") ? "in_progress" :
-        s.includes("partial") ? "partial" :
-        s.includes("cancel") ? "cancelled" : "pending";
-
-      await db.collection("smm_orders").doc(orderId).update({
-        status:     normalized,
-        startCount: status.start_count || null,
-        remains:    status.remains     || null,
-        updatedAt:  admin.firestore.FieldValue.serverTimestamp(),
-      });
-    }
-
-    res.json(status);
-  } catch (err) {
-    console.error("❌ Status check error:", err);
-    res.status(500).json({ error: "Failed to check status" });
-  }
-});
-
-// ── SMM: Reseller balance ─────────────────────────────────────────────────────
-app.get("/api/smm/reseller-balance", async (req, res) => {
-  try {
-    const data = await owletRequest({ action: "balance" });
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch balance" });
   }
 });
 
@@ -459,7 +216,6 @@ app.post("/api/deduct-hourly", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Waveport backend running on port ${PORT}`);
   console.log(`📡 Webhook:  POST /webhook/flutterwave`);
-  console.log(`🛍  SMM:      GET  /api/smm/services`);
   console.log(`💊 Health:   GET  /health`);
 
   // Hourly deductions — every 1 hour
